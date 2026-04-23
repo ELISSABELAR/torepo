@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       total:
-        description: "Total (default: 127962)"
+        description: "Total events (default: 127962)"
         required: false
         default: '127962'
       start:
@@ -12,19 +12,19 @@ on:
         required: false
         default: '0'
       delay:
-        description: "Delay seconds (default: 5)"
+        description: "Delay seconds entre requetes (default: 3)"
         required: false
-        default: '5'
+        default: '3'
 
 permissions:
   contents: write
 
-# Supprime le warning Node.js 20 deprecated
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
 
+  # ── Reset du fichier d'etat avant le lancement des jobs paralleles ─────────
   init:
     runs-on: ubuntu-latest
     steps:
@@ -32,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: setup
+      - name: reset state
         run: |
           git config user.email "bot@users.noreply.github.com"
           git config user.name  "bot"
@@ -41,8 +41,9 @@ jobs:
           mkdir -p state
           echo '{}' > state/sync.json
           git add state/sync.json
-          git diff --cached --quiet || (git commit -m "init" && git push)
+          git diff --cached --quiet || (git commit -m "init state" && git push)
 
+  # ── 5 jobs paralleles, chacun couvre 1/5 des offsets ──────────────────────
   run:
     needs: init
     runs-on: ubuntu-latest
@@ -52,7 +53,7 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        job_id: [0,1,2,3,4]
+        job_id: [0, 1, 2, 3, 4]   # DOIT correspondre a --total-jobs ci-dessous
 
     env:
       GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
@@ -68,32 +69,33 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: deps
+      - name: install deps
         run: |
           pip install requests playwright
           playwright install chromium --with-deps
 
-      - name: config
+      - name: git config
         run: |
           git config user.email "bot@users.noreply.github.com"
           git config user.name  "bot"
           git remote set-url origin \
             https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
 
+      # Echelonne les demarrages pour eviter que tous les jobs frappent l'origine en meme temps
       - name: run
         run: |
-          # Échelonne les démarrages : job0=0s, job1=20s, job2=40s, ..., job7=140s
-          sleep $(( ${{ matrix.job_id }} * 20 ))
+          sleep $(( ${{ matrix.job_id }} * 15 ))
           python main.py \
-            --job-id     ${{ matrix.job_id }}                           \
-            --total-jobs 8                                               \
+            --job-id     ${{ matrix.job_id }} \
+            --total-jobs 5 \
             --total      "${{ github.event.inputs.total || '127962' }}" \
             --start      "${{ github.event.inputs.start || '0'      }}" \
-            --delay      "${{ github.event.inputs.delay || '5'       }}"
+            --delay      "${{ github.event.inputs.delay || '3'      }}"
 
-      - name: push
+      # Push des fichiers collectes (toujours, meme si le job a ete annule)
+      - name: push data
         if: always()
         run: |
           git pull --rebase origin main || true
           git add v1/ || true
-          git diff --cached --quiet || (git commit -m "data" && git push) || true
+          git diff --cached --quiet || (git commit -m "data job${{ matrix.job_id }}" && git push) || true
