@@ -19,6 +19,10 @@ on:
 permissions:
   contents: write
 
+# Supprime le warning Node.js 20 deprecated
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
 
   init:
@@ -78,11 +82,13 @@ jobs:
 
       - name: run
         run: |
+          # Échelonne les démarrages : job0=0s, job1=20s, job2=40s, ..., job7=140s
+          sleep $(( ${{ matrix.job_id }} * 20 ))
           python main.py \
-            --job-id     ${{ matrix.job_id }}                              \
-            --total-jobs 8                                                  \
-            --total      "${{ github.event.inputs.total || '127962' }}"    \
-            --start      "${{ github.event.inputs.start || '0'      }}"    \
+            --job-id     ${{ matrix.job_id }}                           \
+            --total-jobs 8                                               \
+            --total      "${{ github.event.inputs.total || '127962' }}" \
+            --start      "${{ github.event.inputs.start || '0'      }}" \
             --delay      "${{ github.event.inputs.delay || '5'       }}"
 
       - name: push
