@@ -1,0 +1,93 @@
+name: pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      total:
+        description: "Total (default: 127962)"
+        required: false
+        default: '127962'
+      start:
+        description: "Start offset (default: 0)"
+        required: false
+        default: '0'
+      delay:
+        description: "Delay seconds (default: 5)"
+        required: false
+        default: '5'
+
+permissions:
+  contents: write
+
+jobs:
+
+  init:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: setup
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name  "bot"
+          git remote set-url origin \
+            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          mkdir -p state
+          echo '{}' > state/sync.json
+          git add state/sync.json
+          git diff --cached --quiet || (git commit -m "init" && git push)
+
+  run:
+    needs: init
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        job_id: [0,1,2,3,4,5,6,7]
+
+    env:
+      GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      PYTHONUNBUFFERED:  "1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: deps
+        run: |
+          pip install requests playwright
+          playwright install chromium --with-deps
+
+      - name: config
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name  "bot"
+          git remote set-url origin \
+            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+
+      - name: run
+        run: |
+          python main.py \
+            --job-id     ${{ matrix.job_id }}                              \
+            --total-jobs 8                                                  \
+            --total      "${{ github.event.inputs.total || '127962' }}"    \
+            --start      "${{ github.event.inputs.start || '0'      }}"    \
+            --delay      "${{ github.event.inputs.delay || '5'       }}"
+
+      - name: push
+        if: always()
+        run: |
+          git pull --rebase origin main || true
+          git add v1/ || true
+          git diff --cached --quiet || (git commit -m "data" && git push) || true
