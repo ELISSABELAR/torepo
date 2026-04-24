@@ -2,10 +2,12 @@
 """
 Scraper – pointdevente.parionssport.fdj.fr/v1/events
 ─────────────────────────────────────────────────────
-Tous les appels API passent par page.evaluate(fetch()) depuis
-le navigateur Playwright : sec-fetch-*, XSRF-TOKEN, cookies et
-Referer sont positionnés automatiquement et correctement par le
-browser, ce qui évite les 403 dus aux headers incohérents.
+Le endpoint /v1/events est servi comme une réponse document (sec-fetch-dest:
+document, sec-fetch-mode: navigate). On utilise page.goto() directement sur
+l'URL API — le navigateur envoie exactement les mêmes headers qu'un vrai
+utilisateur qui tape l'URL, y compris datadome et le bon Referer.
+NE PAS utiliser fetch() / XMLHttpRequest : ce sont des contextes XHR/cors
+dont les sec-fetch-* sont différents et déclenchent les 403.
 """
 
 import os
@@ -31,56 +33,22 @@ def log(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  BROWSER — session persistante, appels API via fetch() natif du navigateur
+#  BROWSER
 # ─────────────────────────────────────────────────────────────────────────────
 class Browser:
     """
-    Ouvre Chromium une seule fois, navigue vers ORIGIN pour établir
-    les cookies de session (dont XSRF-TOKEN), puis effectue tous les
-    appels API via page.evaluate(fetch()) dans ce même contexte.
+    Stratégie : page.goto(url_api) — navigation document, pas XHR.
 
-    Pourquoi page.evaluate(fetch()) et non requests ?
-    - sec-fetch-dest/mode/site sont positionnés correctement (empty/cors/same-origin)
-    - Angular lit XSRF-TOKEN cookie et l'envoie en X-XSRF-TOKEN header :
-      on reproduit la même logique depuis le JS injecté.
-    - Referer = ORIGIN automatiquement (même session).
-    - Fingerprint TLS = vrai Chrome.
-    """
+    Le endpoint renvoie du JSON brut comme s'il était une page. Le browser
+    navigue dessus, on lit le texte du body et on parse le JSON.
 
-    # JS injecté dans page.evaluate – reproduit Angular HttpClientXsrfModule
-    _JS_FETCH = """
-        async (url) => {
-            // Reproduit Angular HttpClientXsrfModule :
-            // lit XSRF-TOKEN dans les cookies et l'envoie en header X-XSRF-TOKEN
-            const xsrf = (document.cookie.split('; ')
-                .find(c => c.startsWith('XSRF-TOKEN=')) || '')
-                .replace('XSRF-TOKEN=', '');
-
-            let resp;
-            try {
-                resp = await fetch(url, {
-                    method:      'GET',
-                    credentials: 'include',
-                    headers: {
-                        'Accept':       'application/json, text/plain, */*',
-                        'X-XSRF-TOKEN': xsrf,
-                    },
-                });
-            } catch (err) {
-                return { __status: -1, __error: String(err) };
-            }
-
-            if (!resp.ok) {
-                return { __status: resp.status };
-            }
-
-            try {
-                const data = await resp.json();
-                return { __status: 200, data };
-            } catch (err) {
-                return { __status: 200, __parse_error: String(err) };
-            }
-        }
+    Avantages vs fetch/evaluate :
+    - sec-fetch-dest: document  (correct)
+    - sec-fetch-mode: navigate  (correct)
+    - sec-fetch-site: same-origin (on vient de ORIGIN, même domaine)
+    - datadome cookie envoyé automatiquement
+    - Referer = dernière page visitée (ORIGIN)
+    - Aucun header XSRF nécessaire (pas de XHR Angular)
     """
 
     def __init__(self):
@@ -114,18 +82,24 @@ class Browser:
         self._page = self._ctx.new_page()
 
     def warm(self) -> None:
-        """Navigate ORIGIN pour initialiser cookies + XSRF-TOKEN."""
-        log("browser: navigation vers ORIGIN...")
+        """
+        Navigation sur ORIGIN pour obtenir datadome + établir le Referer.
+        Après ça, tous les goto() vers l'API partiront avec:
+          Referer: https://www.pointdevente.parionssport.fdj.fr/grilles/resultats
+          sec-fetch-site: same-origin
+          Cookie: datadome=...
+        """
+        log("browser: warm sur ORIGIN...")
         try:
             self._page.goto(ORIGIN, wait_until="domcontentloaded", timeout=45_000)
-            time.sleep(3 + random.uniform(0, 2))
+            time.sleep(2 + random.uniform(0, 1.5))
             cookies = {c["name"]: c["value"] for c in self._ctx.cookies()}
-            if "XSRF-TOKEN" in cookies:
-                log(f"session ok — XSRF-TOKEN={cookies['XSRF-TOKEN'][:12]}...")
-            else:
-                log(f"ATTENTION: XSRF-TOKEN absent — cookies: {list(cookies.keys())}")
+            names   = list(cookies.keys())
+            log(f"warm ok — cookies: {names}")
+            if "datadome" not in cookies:
+                log("ATTENTION: datadome absent apres warm")
         except Exception as e:
-            log(f"browser warm error: {e}")
+            log(f"warm error: {e}")
 
     def close(self) -> None:
         try:
@@ -136,53 +110,60 @@ class Browser:
 
     def fetch_json(self, offset: int):
         """
-        Retourne :
-          dict        -> succes
-          None        -> echec definitif (skip)
-          "__retry"   -> retry demande (re-warm + nouvel essai)
+        Navigation directe vers l'URL API.
+        Retourne : dict | None | "__retry"
         """
-        url = (
-            f"{BASE_URL}"
-            f"?status=resulted&offset={offset}&limit={LIMIT}&sort=DESC"
-        )
+        url = f"{BASE_URL}?status=resulted&offset={offset}&limit={LIMIT}&sort=DESC"
+
         try:
-            result = self._page.evaluate(self._JS_FETCH, url)
+            resp = self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         except Exception as e:
-            log(f"evaluate error @ {offset}: {e}")
-            time.sleep(5)
+            log(f"goto error @ {offset}: {e}")
+            time.sleep(3)
             return "__retry"
 
-        status = result.get("__status", 0)
+        status = resp.status if resp else 0
 
         if status == 200:
-            if "data" in result:
-                return result["data"]
-            log(f"parse error @ {offset}: {result.get('__parse_error')}")
-            return None
+            try:
+                # Le serveur renvoie du JSON brut — on lit le texte de la page
+                raw = self._page.evaluate("() => document.body.innerText")
+                data = json.loads(raw)
+                return data
+            except Exception as e:
+                log(f"parse error @ {offset}: {e}")
+                # Renavigue sur ORIGIN pour remettre le contexte correct
+                self.warm()
+                return "__retry"
 
-        if status == 403:
-            log(f"403 @ {offset} → re-warm session")
+        elif status == 403:
+            log(f"403 @ {offset} → re-warm")
             self.warm()
             return "__retry"
 
-        if status == 429:
+        elif status == 429:
             log(f"429 @ {offset} → pause 90s")
             time.sleep(90)
+            # Remettre le contexte document correct avant le retry
+            self.warm()
             return "__retry"
 
-        if status == -1:
-            log(f"network error @ {offset}: {result.get('__error')}")
+        elif status == 500:
+            log(f"500 @ {offset} → retry dans 5s")
             time.sleep(5)
+            # Re-warm pour repartir d'un bon Referer
+            self.warm()
             return "__retry"
 
-        log(f"http {status} @ {offset}")
-        return None
+        else:
+            log(f"http {status} @ {offset}")
+            return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STOCKAGE LOCAL
+#  STOCKAGE
 # ─────────────────────────────────────────────────────────────────────────────
-def save(data: dict, offset: int) -> Path:
+def save(data, offset: int) -> Path:
     OUT.mkdir(parents=True, exist_ok=True)
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = OUT / f"offset_{offset:07d}_{ts}.json"
@@ -195,13 +176,13 @@ def exists(offset: int) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ETAT PARTAGE VIA GITHUB API
+#  ETAT GITHUB
 # ─────────────────────────────────────────────────────────────────────────────
 GH_API  = "https://api.github.com"
 GH_TOK  = os.environ.get("GITHUB_TOKEN", "")
 GH_REPO = os.environ.get("GITHUB_REPOSITORY", "")
 
-_STATE_WRITE_EVERY = 10   # ecrire l'etat tous les N offsets traites
+_STATE_WRITE_EVERY = 10
 
 
 def _gh_headers() -> dict:
@@ -263,12 +244,12 @@ def main() -> None:
     ap.add_argument("--total-jobs", type=int,   default=5)
     ap.add_argument("--total",      type=int,   default=127_962)
     ap.add_argument("--start",      type=int,   default=0)
-    ap.add_argument("--delay",      type=float, default=3.0)
+    ap.add_argument("--delay",      type=float, default=2.0)
     ap.add_argument("--no-sync",    action="store_true")
     args = ap.parse_args()
 
     _JID   = args.job_id
-    stride = args.total_jobs * LIMIT            # ex. 5*100 = 500
+    stride = args.total_jobs * LIMIT
 
     last       = ((args.total - 1) // LIMIT) * LIMIT
     my_start   = args.start + args.job_id * LIMIT
@@ -276,29 +257,27 @@ def main() -> None:
 
     log(f"start={my_start}  stride={stride}  pages={len(my_offsets)}")
 
-    # ── init ─────────────────────────────────────────────────────────────────
     browser = Browser()
     browser.warm()
 
     st   = read_state() if not args.no_sync else {"sha": None, "data": {}}
     done = fail = skip = 0
 
-    # ── boucle principale ────────────────────────────────────────────────────
     for i, offset in enumerate(my_offsets, 1):
 
         if exists(offset):
-            log(f"[{i}/{len(my_offsets)}] skip (deja present) off={offset}")
+            log(f"[{i}/{len(my_offsets)}] skip off={offset}")
             skip += 1
             continue
 
-        # Retry loop (max 3 tentatives par offset)
+        # Retry loop (max 4 tentatives)
         data  = None
         tries = 0
-        while tries < 3:
+        while tries < 4:
             result = browser.fetch_json(offset)
             if result == "__retry":
                 tries += 1
-                time.sleep(2 ** tries)   # backoff 2s / 4s / 8s
+                time.sleep(min(2 ** tries, 30))
                 continue
             data = result
             break
@@ -310,24 +289,17 @@ def main() -> None:
             path = save(data, offset)
             done += 1
             total_hint = (
-                data.get("total", "?")
-                if isinstance(data, dict)
+                data.get("total", "?") if isinstance(data, dict)
                 else len(data)
             )
-            log(
-                f"[{i}/{len(my_offsets)}] ok  "
-                f"off={offset}  total={total_hint}  "
-                f"→ {path.name}"
-            )
+            log(f"[{i}/{len(my_offsets)}] ok  off={offset}  total={total_hint}  → {path.name}")
 
-        # Ecriture etat periodique
         if not args.no_sync and i % _STATE_WRITE_EVERY == 0:
             write_state(args.job_id, offset, st)
 
         if i < len(my_offsets):
             time.sleep(args.delay + random.uniform(0, 1.5))
 
-    # Ecriture etat finale
     if not args.no_sync and my_offsets:
         write_state(args.job_id, my_offsets[-1], st)
 
