@@ -2,12 +2,17 @@
 """
 Scraper – pointdevente.parionssport.fdj.fr/v1/events
 ─────────────────────────────────────────────────────
-Le endpoint /v1/events est servi comme une réponse document (sec-fetch-dest:
-document, sec-fetch-mode: navigate). On utilise page.goto() directement sur
-l'URL API — le navigateur envoie exactement les mêmes headers qu'un vrai
-utilisateur qui tape l'URL, y compris datadome et le bon Referer.
-NE PAS utiliser fetch() / XMLHttpRequest : ce sont des contextes XHR/cors
-dont les sec-fetch-* sont différents et déclenchent les 403.
+Architecture hybride :
+  - Playwright  → visite ORIGIN pour obtenir/renouveler les cookies (datadome, TCPID, ...)
+                  Le browser ne touche JAMAIS l'URL API (évite la détection headless sur l'API)
+  - requests    → appels API avec les cookies extraits + headers document navigation
+
+Pourquoi cette séparation ?
+  DataDome peut analyser le fingerprint headless lors d'une navigation browser vers l'API.
+  Sur un endpoint JSON qui répond immédiatement, DataDome ne peut pas exécuter son JS
+  de fingerprinting → les cookies obtenus via Playwright fonctionnent dans requests.
+  Les 500 = vraies erreurs backend (pagination profonde, serveur lent), pas des blocages.
+  Les 403 = cookie expiré côté DataDome → on le renouvelle via Playwright et on retente.
 """
 
 import os
@@ -33,22 +38,13 @@ def log(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  BROWSER
+#  COOKIE MANAGER — Playwright pour cookies, requests pour les appels API
 # ─────────────────────────────────────────────────────────────────────────────
-class Browser:
+class CookieManager:
     """
-    Stratégie : page.goto(url_api) — navigation document, pas XHR.
-
-    Le endpoint renvoie du JSON brut comme s'il était une page. Le browser
-    navigue dessus, on lit le texte du body et on parse le JSON.
-
-    Avantages vs fetch/evaluate :
-    - sec-fetch-dest: document  (correct)
-    - sec-fetch-mode: navigate  (correct)
-    - sec-fetch-site: same-origin (on vient de ORIGIN, même domaine)
-    - datadome cookie envoyé automatiquement
-    - Referer = dernière page visitée (ORIGIN)
-    - Aucun header XSRF nécessaire (pas de XHR Angular)
+    Visite ORIGIN avec un vrai browser pour obtenir les cookies de session.
+    Retourne un jar requests utilisable directement dans les appels API.
+    Le browser ne navigue JAMAIS vers l'URL API.
     """
 
     def __init__(self):
@@ -72,7 +68,7 @@ class Browser:
             ),
             viewport={"width": 1366, "height": 768},
             extra_http_headers={
-                "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
             },
         )
         self._ctx.add_init_script("""
@@ -81,25 +77,27 @@ class Browser:
         """)
         self._page = self._ctx.new_page()
 
-    def warm(self) -> None:
+    def get_cookies(self) -> dict:
         """
-        Navigation sur ORIGIN pour obtenir datadome + établir le Referer.
-        Après ça, tous les goto() vers l'API partiront avec:
-          Referer: https://www.pointdevente.parionssport.fdj.fr/grilles/resultats
-          sec-fetch-site: same-origin
-          Cookie: datadome=...
+        Navigue sur ORIGIN, attend que DataDome valide le cookie,
+        retourne un dict {name: value} de tous les cookies du domaine.
         """
-        log("browser: warm sur ORIGIN...")
+        log("browser: navigation ORIGIN pour cookies...")
         try:
             self._page.goto(ORIGIN, wait_until="domcontentloaded", timeout=45_000)
-            time.sleep(2 + random.uniform(0, 1.5))
+            # Laisse DataDome finir sa validation côté client
+            time.sleep(3 + random.uniform(0, 2))
             cookies = {c["name"]: c["value"] for c in self._ctx.cookies()}
             names   = list(cookies.keys())
-            log(f"warm ok — cookies: {names}")
-            if "datadome" not in cookies:
-                log("ATTENTION: datadome absent apres warm")
+            if "datadome" in cookies:
+                dd = cookies["datadome"]
+                log(f"cookies ok — {names} — datadome={dd[:16]}...")
+            else:
+                log(f"ATTENTION datadome absent — cookies: {names}")
+            return cookies
         except Exception as e:
-            log(f"warm error: {e}")
+            log(f"get_cookies error: {e}")
+            return {}
 
     def close(self) -> None:
         try:
@@ -108,56 +106,127 @@ class Browser:
         except Exception:
             pass
 
-    def fetch_json(self, offset: int):
-        """
-        Navigation directe vers l'URL API.
-        Retourne : dict | None | "__retry"
-        """
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SESSION REQUESTS — appels API avec headers document navigation
+# ─────────────────────────────────────────────────────────────────────────────
+class ApiSession:
+    """
+    Session requests configurée comme une navigation document depuis ORIGIN.
+    Headers identiques à ce qu'envoie Chrome quand l'utilisateur navigue
+    vers une URL sur le même domaine (sec-fetch-site: same-origin, mode: navigate).
+    """
+
+    UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self):
+        self._session = _requests.Session()
+        self._session.headers.update({
+            # Headers d'une navigation document Chrome → même domaine
+            "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Encoding":           "gzip, deflate, br, zstd",
+            "Accept-Language":           "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control":             "max-age=0",
+            "Referer":                   ORIGIN,
+            "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile":          "?0",
+            "Sec-Ch-Ua-Platform":        '"Windows"',
+            "Sec-Fetch-Dest":            "document",
+            "Sec-Fetch-Mode":            "navigate",
+            "Sec-Fetch-Site":            "same-origin",
+            "Sec-Fetch-User":            "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "User-Agent":                self.UA,
+        })
+
+    def set_cookies(self, cookies: dict) -> None:
+        """Charge tous les cookies obtenus par le CookieManager."""
+        for name, value in cookies.items():
+            self._session.cookies.set(
+                name, value,
+                domain=".pointdevente.parionssport.fdj.fr",
+            )
+
+    def update_cookies(self, response: _requests.Response) -> None:
+        """Absorbe les Set-Cookie que le serveur renvoie (DataDome rotation)."""
+        for c in response.cookies:
+            self._session.cookies.set(c.name, c.value, domain=c.domain or ".pointdevente.parionssport.fdj.fr")
+
+    def get(self, offset: int) -> _requests.Response:
         url = f"{BASE_URL}?status=resulted&offset={offset}&limit={LIMIT}&sort=DESC"
+        return self._session.get(url, timeout=30)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FETCH avec retry
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch(offset: int, session: ApiSession, cm: CookieManager) -> dict | None:
+    """
+    Retourne le JSON parsé ou None (skip définitif après max retries).
+    Gère :
+      200 → succès
+      500 → erreur backend (serveur lent / pagination profonde) : retry avec backoff
+      403 → cookie expiré : renouvellement via browser + retry
+      429 → rate limit : pause longue
+    """
+    consecutive_403 = 0
+
+    for attempt in range(8):
         try:
-            resp = self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        except Exception as e:
-            log(f"goto error @ {offset}: {e}")
-            time.sleep(3)
-            return "__retry"
-
-        status = resp.status if resp else 0
-
-        if status == 200:
-            try:
-                # Le serveur renvoie du JSON brut — on lit le texte de la page
-                raw = self._page.evaluate("() => document.body.innerText")
-                data = json.loads(raw)
-                return data
-            except Exception as e:
-                log(f"parse error @ {offset}: {e}")
-                # Renavigue sur ORIGIN pour remettre le contexte correct
-                self.warm()
-                return "__retry"
-
-        elif status == 403:
-            log(f"403 @ {offset} → re-warm")
-            self.warm()
-            return "__retry"
-
-        elif status == 429:
-            log(f"429 @ {offset} → pause 90s")
-            time.sleep(90)
-            # Remettre le contexte document correct avant le retry
-            self.warm()
-            return "__retry"
-
-        elif status == 500:
-            log(f"500 @ {offset} → retry dans 5s")
+            resp = session.get(offset)
+        except _requests.exceptions.Timeout:
+            log(f"timeout @ {offset} — retry {attempt}")
             time.sleep(5)
-            # Re-warm pour repartir d'un bon Referer
-            self.warm()
-            return "__retry"
+            continue
+        except Exception as e:
+            log(f"erreur réseau @ {offset}: {e} — retry {attempt}")
+            time.sleep(5)
+            continue
+
+        session.update_cookies(resp)
+
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except Exception:
+                log(f"json invalide @ {offset} — retry {attempt}")
+                time.sleep(2)
+                continue
+
+        elif resp.status_code == 500:
+            # Erreur backend réelle (serveur lent, pagination profonde)
+            # Backoff progressif : 5s, 10s, 20s, 40s...
+            wait = min(5 * (2 ** attempt), 120)
+            log(f"500 @ {offset} — retry {attempt+1}/8 dans {wait}s")
+            time.sleep(wait)
+            continue
+
+        elif resp.status_code == 403:
+            consecutive_403 += 1
+            if consecutive_403 >= 3:
+                log(f"403x3 @ {offset} — skip définitif")
+                return None
+            log(f"403 @ {offset} — renouvellement cookie ({consecutive_403}/3)")
+            new_cookies = cm.get_cookies()
+            if new_cookies:
+                session.set_cookies(new_cookies)
+            time.sleep(5 + random.uniform(0, 3))
+            continue
+
+        elif resp.status_code == 429:
+            log(f"429 @ {offset} — pause 90s")
+            time.sleep(90)
+            continue
 
         else:
-            log(f"http {status} @ {offset}")
+            log(f"http {resp.status_code} @ {offset} — skip")
             return None
+
+    log(f"max retries @ {offset} — skip")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,7 +245,7 @@ def exists(offset: int) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ETAT GITHUB
+#  ETAT GITHUB API
 # ─────────────────────────────────────────────────────────────────────────────
 GH_API  = "https://api.github.com"
 GH_TOK  = os.environ.get("GITHUB_TOKEN", "")
@@ -257,8 +326,13 @@ def main() -> None:
 
     log(f"start={my_start}  stride={stride}  pages={len(my_offsets)}")
 
-    browser = Browser()
-    browser.warm()
+    # Init : cookies via browser, puis toutes les requêtes via requests
+    cm      = CookieManager()
+    session = ApiSession()
+
+    cookies = cm.get_cookies()
+    if cookies:
+        session.set_cookies(cookies)
 
     st   = read_state() if not args.no_sync else {"sha": None, "data": {}}
     done = fail = skip = 0
@@ -270,17 +344,7 @@ def main() -> None:
             skip += 1
             continue
 
-        # Retry loop (max 4 tentatives)
-        data  = None
-        tries = 0
-        while tries < 4:
-            result = browser.fetch_json(offset)
-            if result == "__retry":
-                tries += 1
-                time.sleep(min(2 ** tries, 30))
-                continue
-            data = result
-            break
+        data = fetch(offset, session, cm)
 
         if data is None:
             fail += 1
@@ -303,7 +367,7 @@ def main() -> None:
     if not args.no_sync and my_offsets:
         write_state(args.job_id, my_offsets[-1], st)
 
-    browser.close()
+    cm.close()
     log(f"termine — done={done}  fail={fail}  skip={skip}")
 
 
