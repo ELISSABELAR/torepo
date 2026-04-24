@@ -12,9 +12,9 @@ on:
         required: false
         default: '0'
       delay:
-        description: "Delay seconds entre requetes (default: 3)"
+        description: "Delay seconds entre requetes (default: 2)"
         required: false
-        default: '3'
+        default: '2'
 
 permissions:
   contents: write
@@ -24,14 +24,12 @@ env:
 
 jobs:
 
-  # ── Reset du fichier d'etat avant le lancement des jobs paralleles ─────────
   init:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: reset state
         run: |
           git config user.email "bot@users.noreply.github.com"
@@ -43,7 +41,6 @@ jobs:
           git add state/sync.json
           git diff --cached --quiet || (git commit -m "init state" && git push)
 
-  # ── 5 jobs paralleles, chacun couvre 1/5 des offsets ──────────────────────
   run:
     needs: init
     runs-on: ubuntu-latest
@@ -53,7 +50,7 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        job_id: [0, 1, 2, 3, 4]   # DOIT correspondre a --total-jobs ci-dessous
+        job_id: [0, 1, 2, 3, 4]
 
     env:
       GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
@@ -71,7 +68,8 @@ jobs:
 
       - name: install deps
         run: |
-          pip install requests playwright
+          # curl-cffi = TLS fingerprint Chrome exact (JA3/JA4)
+          pip install curl-cffi requests playwright
           playwright install chromium --with-deps
 
       - name: git config
@@ -81,7 +79,6 @@ jobs:
           git remote set-url origin \
             https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
 
-      # Echelonne les demarrages pour eviter que tous les jobs frappent l'origine en meme temps
       - name: run
         run: |
           sleep $(( ${{ matrix.job_id }} * 15 ))
@@ -90,9 +87,8 @@ jobs:
             --total-jobs 5 \
             --total      "${{ github.event.inputs.total || '127962' }}" \
             --start      "${{ github.event.inputs.start || '0'      }}" \
-            --delay      "${{ github.event.inputs.delay || '3'      }}"
+            --delay      "${{ github.event.inputs.delay || '2'      }}"
 
-      # Push des fichiers collectes (toujours, meme si le job a ete annule)
       - name: push data
         if: always()
         run: |
